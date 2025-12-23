@@ -1,411 +1,185 @@
-#!/usr/bin/env python3
 """
-Stage 2: The Factory - Video Rendering Pipeline
-================================================
-
-This script bridges n8n Stage 1 (The Hunter) and Stage 3 (The Broadcaster).
-
-Process:
-1. Read rows from Google Sheets where Status = 'Ready'
-2. Claim row by setting Status = 'Processing'
-3. Render video using your preferred method (MoviePy, FFmpeg, etc.)
-4. Upload to Google Drive
-5. Update row with drive_file_id and Status = 'Done'
-
-Requirements:
-    pip install gspread google-auth google-api-python-client moviepy
-
-Setup:
-    1. Create a Google Cloud project
-    2. Enable Sheets API and Drive API
-    3. Create a service account and download credentials.json
-    4. Share your Google Sheet with the service account email
-
-Usage:
-    python stage2_factory.py
-
-    Or run as a cron job:
-    */15 * * * * /usr/bin/python3 /path/to/stage2_factory.py >> /var/log/factory.log 2>&1
+Stage 2: The Factory - Flask Web App
+Deploy to Render.com (free tier)
 """
-
 import os
 import json
 import logging
+import threading
 from datetime import datetime
-from typing import Optional, Dict, Any
-
+from flask import Flask, request, jsonify
 # Google APIs
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-
-# ============================================================================
+import requests
+# =============================================================================
+# FLASK APP - This line is CRITICAL for Gunicorn
+# =============================================================================
+app = Flask(__name__)
+# =============================================================================
 # CONFIGURATION
-# ============================================================================
-
-# Path to your Google service account credentials
-CREDENTIALS_FILE = os.environ.get(
-    'GOOGLE_CREDENTIALS_FILE',
-    './credentials.json'
-)
-
-# Google Sheet ID (from the URL)
-SHEET_ID = os.environ.get(
-    'GOOGLE_SHEET_ID',
-    'REPLACE_WITH_YOUR_SHEET_ID'
-)
-
-# Sheet tab name
-SHEET_NAME = 'ETL_Pipeline'
-
-# Google Drive folder ID for uploads
-DRIVE_FOLDER_ID = os.environ.get(
-    'GOOGLE_DRIVE_FOLDER_ID',
-    'REPLACE_WITH_YOUR_FOLDER_ID'
-)
-
-# Temp directory for video rendering
-TEMP_DIR = os.environ.get('TEMP_DIR', './temp')
-
-# Logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# =============================================================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
-
-# ============================================================================
+SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '')
+SHEET_NAME = 'ETL_Pipeline'
+DRIVE_FOLDER_ID = os.environ.get('GOOGLE_DRIVE_FOLDER', '')
+TEMP_DIR = '/tmp'
+# =============================================================================
 # GOOGLE API SETUP
-# ============================================================================
-
+# =============================================================================
 def get_google_credentials():
-    """Load Google service account credentials."""
-    scopes = [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/drive.file'
-    ]
-    return Credentials.from_service_account_file(
-        CREDENTIALS_FILE,
-        scopes=scopes
-    )
-
+    creds_json = os.environ.get('GOOGLE_CREDENTIALS', '')
+    if not creds_json:
+        raise ValueError("GOOGLE_CREDENTIALS not set")
+    creds_dict = json.loads(creds_json)
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
+    return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 def get_sheets_client():
-    """Get authenticated Google Sheets client."""
-    creds = get_google_credentials()
-    return gspread.authorize(creds)
-
+    return gspread.authorize(get_google_credentials())
 def get_drive_service():
-    """Get authenticated Google Drive service."""
-    creds = get_google_credentials()
-    return build('drive', 'v3', credentials=creds)
-
-# ============================================================================
+    return build('drive', 'v3', credentials=get_google_credentials())
+# =============================================================================
 # GOOGLE SHEETS OPERATIONS
-# ============================================================================
-
-def get_ready_rows(sheet) -> list:
-    """
-    Fetch all rows where Status = 'Ready'.
-    
-    Returns:
-        List of dicts with row data and row number
-    """
-    all_records = sheet.get_all_records()
-    ready_rows = []
-    
-    for idx, record in enumerate(all_records, start=2):  # Row 1 is header
-        if record.get('Status', '').lower() == 'ready':
-            record['_row_number'] = idx
-            ready_rows.append(record)
-    
-    logger.info(f"Found {len(ready_rows)} rows with Status='Ready'")
-    return ready_rows
-
-def claim_row(sheet, row_number: int, record_id: str) -> bool:
-    """
-    Claim a row by setting Status to 'Processing'.
-    
-    This prevents race conditions if multiple instances run.
-    """
+# =============================================================================
+def find_row_by_id(sheet, record_id):
     try:
-        # Find Status column (assuming it's column J = index 10)
-        status_col = sheet.find('Status').col
-        
-        # Update to 'Processing'
-        sheet.update_cell(row_number, status_col, 'Processing')
-        logger.info(f"Claimed row {row_number} (id={record_id})")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to claim row {row_number}: {e}")
-        return False
-
-def update_row_done(sheet, row_number: int, drive_file_id: str) -> bool:
-    """
-    Update row with drive_file_id and Status = 'Done'.
-    """
-    try:
-        # Find column indices
-        header_row = sheet.row_values(1)
-        status_col = header_row.index('Status') + 1
+        cell = sheet.find(record_id)
+        return cell.row if cell else None
+    except:
+        return None
+def update_row_status(sheet, row_number, status, drive_file_id=None, error_msg=None):
+    header_row = sheet.row_values(1)
+    status_col = header_row.index('Status') + 1
+    sheet.update_cell(row_number, status_col, status)
+    
+    if drive_file_id and 'drive_file_id' in header_row:
         drive_col = header_row.index('drive_file_id') + 1
-        
-        # Batch update
-        sheet.update_cell(row_number, status_col, 'Done')
         sheet.update_cell(row_number, drive_col, drive_file_id)
-        
-        logger.info(f"Row {row_number} marked as Done (drive_file_id={drive_file_id})")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to update row {row_number}: {e}")
-        return False
-
-def update_row_error(sheet, row_number: int, error_message: str) -> bool:
-    """
-    Update row with error status and message.
-    """
-    try:
-        header_row = sheet.row_values(1)
-        status_col = header_row.index('Status') + 1
+    
+    if error_msg and 'error_message' in header_row:
         error_col = header_row.index('error_message') + 1
-        
-        sheet.update_cell(row_number, status_col, 'Error')
-        sheet.update_cell(row_number, error_col, error_message[:500])  # Truncate
-        
-        logger.info(f"Row {row_number} marked as Error")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to update row {row_number} with error: {e}")
-        return False
-
-# ============================================================================
-# VIDEO RENDERING
-# ============================================================================
-
-def render_video(record: Dict[str, Any], output_path: str) -> bool:
-    """
-    Render video from the record data.
-    
-    This is a placeholder - implement your actual rendering logic here.
-    
-    Options:
-    - MoviePy: Python library for video editing
-    - FFmpeg: Command-line video processing
-    - Remotion: React-based video rendering
-    - Custom API: Call your rendering service
-    
-    Args:
-        record: Dict with script, image_prompt, title, etc.
-        output_path: Where to save the rendered video
-        
-    Returns:
-        True if successful, False otherwise
-    """
+        sheet.update_cell(row_number, error_col, error_msg[:500])
+# =============================================================================
+# VIDEO RENDERING (PLACEHOLDER)
+# =============================================================================
+def render_video(record, output_path):
+    """Replace this with your actual video rendering logic."""
     logger.info(f"Rendering video for: {record.get('title', 'Unknown')}")
-    
-    # ========================================================================
-    # PLACEHOLDER: Replace with your actual video rendering logic
-    # ========================================================================
-    
-    # Example using MoviePy (uncomment and modify as needed):
-    """
-    from moviepy.editor import (
-        TextClip, ColorClip, CompositeVideoClip, 
-        concatenate_videoclips, AudioFileClip
-    )
-    
-    # Get data from record
-    script = record.get('script', '')
-    title = record.get('ai_title', record.get('title', 'News'))
-    image_prompt = record.get('image_prompt', '')
-    
-    # Create video clips
-    # 1. Generate background image from image_prompt (use DALL-E, Pollinations, etc.)
-    # 2. Generate audio from script (use EdgeTTS, ElevenLabs, etc.)
-    # 3. Combine into final video
-    
-    # Example: Simple text on color background
-    duration = 30  # seconds
-    
-    background = ColorClip(size=(1920, 1080), color=(30, 30, 50), duration=duration)
-    
-    title_clip = TextClip(
-        title,
-        fontsize=60,
-        color='white',
-        font='Arial-Bold',
-        size=(1800, None)
-    ).set_position('center').set_duration(duration)
-    
-    final = CompositeVideoClip([background, title_clip])
-    final.write_videofile(output_path, fps=24, codec='libx264')
-    
-    return True
-    """
-    
-    # For now, create a placeholder file for testing
-    import shutil
-    
-    # Check if you have a template video to copy
-    template_video = './template_video.mp4'
-    if os.path.exists(template_video):
-        shutil.copy(template_video, output_path)
-        logger.info(f"Copied template video to {output_path}")
+    try:
+        # Placeholder: download a sample video
+        response = requests.get("https://www.w3schools.com/html/mov_bbb.mp4", timeout=30)
+        with open(output_path, 'wb') as f:
+            f.write(response.content)
         return True
-    
-    # Create empty file for testing (replace with real rendering)
-    logger.warning("No template video found - creating placeholder")
-    with open(output_path, 'wb') as f:
-        f.write(b'PLACEHOLDER VIDEO FILE')
-    
-    return True
-
-# ============================================================================
+    except Exception as e:
+        logger.error(f"Render failed: {e}")
+        return False
+# =============================================================================
 # GOOGLE DRIVE UPLOAD
-# ============================================================================
-
-def upload_to_drive(file_path: str, file_name: str) -> Optional[str]:
-    """
-    Upload a file to Google Drive.
-    
-    Args:
-        file_path: Local path to the video file
-        file_name: Name for the file in Drive
-        
-    Returns:
-        Google Drive file ID if successful, None otherwise
-    """
+# =============================================================================
+def upload_to_drive(file_path, file_name):
     try:
         service = get_drive_service()
+        file_metadata = {'name': file_name}
+        if DRIVE_FOLDER_ID:
+            file_metadata['parents'] = [DRIVE_FOLDER_ID]
         
-        file_metadata = {
-            'name': file_name,
-            'parents': [DRIVE_FOLDER_ID] if DRIVE_FOLDER_ID else []
-        }
-        
-        media = MediaFileUpload(
-            file_path,
-            mimetype='video/mp4',
-            resumable=True
-        )
-        
-        file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id'
-        ).execute()
-        
-        file_id = file.get('id')
-        logger.info(f"Uploaded to Drive: {file_name} (id={file_id})")
-        
-        return file_id
-        
+        media = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
+        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        return file.get('id')
     except Exception as e:
-        logger.error(f"Failed to upload to Drive: {e}")
+        logger.error(f"Upload failed: {e}")
         return None
-
-# ============================================================================
-# MAIN PROCESSING LOOP
-# ============================================================================
-
-def process_row(sheet, record: Dict[str, Any]) -> bool:
-    """
-    Process a single row through the video pipeline.
-    
-    Args:
-        sheet: Google Sheet worksheet object
-        record: Row data with _row_number
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    row_number = record['_row_number']
-    record_id = record.get('id', f'row-{row_number}')
-    title = record.get('title', 'Unknown')
-    
-    logger.info(f"Processing: {title}")
-    
-    # Step 1: Claim the row
-    if not claim_row(sheet, row_number, record_id):
-        return False
-    
+# =============================================================================
+# PROCESSING LOGIC
+# =============================================================================
+def process_record(record_id):
+    logger.info(f"Processing: {record_id}")
     try:
-        # Step 2: Prepare output path
-        os.makedirs(TEMP_DIR, exist_ok=True)
+        client = get_sheets_client()
+        sheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+        
+        row_number = find_row_by_id(sheet, record_id)
+        if not row_number:
+            logger.error(f"Record not found: {record_id}")
+            return
+        
+        header_row = sheet.row_values(1)
+        row_values = sheet.row_values(row_number)
+        record = dict(zip(header_row, row_values))
+        
+        update_row_status(sheet, row_number, 'Processing')
+        
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        safe_title = ''.join(c for c in title[:30] if c.isalnum() or c in ' -_')
+        title = record.get('title', 'video')[:20]
+        safe_title = ''.join(c for c in title if c.isalnum() or c in ' -_')
         output_filename = f"{timestamp}_{safe_title}.mp4"
         output_path = os.path.join(TEMP_DIR, output_filename)
         
-        # Step 3: Render video
         if not render_video(record, output_path):
             raise Exception("Video rendering failed")
         
-        # Step 4: Upload to Google Drive
         drive_file_id = upload_to_drive(output_path, output_filename)
         if not drive_file_id:
             raise Exception("Drive upload failed")
         
-        # Step 5: Update sheet with success
-        update_row_done(sheet, row_number, drive_file_id)
+        update_row_status(sheet, row_number, 'Done', drive_file_id=drive_file_id)
         
-        # Step 6: Cleanup temp file
         if os.path.exists(output_path):
             os.remove(output_path)
-            logger.info(f"Cleaned up temp file: {output_path}")
         
-        logger.info(f"✅ Successfully processed: {title}")
-        return True
+        logger.info(f"✅ Done: {record_id}")
         
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"❌ Failed to process {title}: {error_msg}")
-        update_row_error(sheet, row_number, error_msg)
-        return False
-
-def main():
-    """
-    Main entry point for the Factory script.
-    """
-    logger.info("=" * 60)
-    logger.info("Stage 2: The Factory - Starting")
-    logger.info("=" * 60)
+        logger.error(f"❌ Failed: {e}")
+        try:
+            update_row_status(sheet, row_number, 'Error', error_msg=str(e))
+        except:
+            pass
+# =============================================================================
+# FLASK ROUTES
+# =============================================================================
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'service': 'Stage 2: The Factory'})
+@app.route('/process', methods=['POST'])
+def process():
+    data = request.get_json() or {}
+    record_id = data.get('record_id')
+    
+    if not record_id:
+        return jsonify({'error': 'record_id required'}), 400
+    if not SHEET_ID:
+        return jsonify({'error': 'GOOGLE_SHEET_ID not set'}), 500
+    
+    thread = threading.Thread(target=process_record, args=(record_id,))
+    thread.start()
+    
+    return jsonify({'status': 'accepted', 'record_id': record_id}), 202
+@app.route('/process-all', methods=['POST'])
+def process_all():
+    if not SHEET_ID:
+        return jsonify({'error': 'GOOGLE_SHEET_ID not set'}), 500
     
     try:
-        # Connect to Google Sheets
         client = get_sheets_client()
-        spreadsheet = client.open_by_key(SHEET_ID)
-        sheet = spreadsheet.worksheet(SHEET_NAME)
+        sheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+        records = sheet.get_all_records()
+        ready_ids = [r['id'] for r in records if r.get('Status', '').lower() == 'ready' and r.get('id')]
         
-        # Get ready rows
-        ready_rows = get_ready_rows(sheet)
+        for rid in ready_ids:
+            thread = threading.Thread(target=process_record, args=(rid,))
+            thread.start()
         
-        if not ready_rows:
-            logger.info("No rows to process. Exiting.")
-            return
-        
-        # Process each row
-        success_count = 0
-        error_count = 0
-        
-        for record in ready_rows:
-            if process_row(sheet, record):
-                success_count += 1
-            else:
-                error_count += 1
-        
-        # Summary
-        logger.info("=" * 60)
-        logger.info(f"Processing complete: {success_count} success, {error_count} errors")
-        logger.info("=" * 60)
-        
+        return jsonify({'status': 'accepted', 'count': len(ready_ids)}), 202
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise
-
+        return jsonify({'error': str(e)}), 500
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 if __name__ == '__main__':
-    main()
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
